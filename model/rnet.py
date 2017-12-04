@@ -1,9 +1,10 @@
 # TODO: add bias
 import math
+import tensorflow as tf
 from rnn_cells import mat_weight_mul, GatedAttentionCell, GatedAttentionSelfMatchingCell, PointerGRUCell
 
-class RNet:
 
+class RNet:
     @staticmethod
     def random_weight(dim_in, dim_out, name=None, stddev=1.0):
         return tf.Variable(tf.truncated_normal([dim_in, dim_out], stddev=stddev / math.sqrt(float(dim_in))), name=name)
@@ -19,6 +20,8 @@ class RNet:
             self.Wg = self.random_weight(4 * h, 4 * h, name='Wg')
             self.WvP_hat = self.random_weight(h, h, name='WvP_hat')
             self.WvQ = self.random_weight(1, h, name='WvQ')
+            self.Wha = self.random_weight(2 * h, h, name='Wha')
+            self.WhP = self.random_weight(2 * h, h, name='WhP')
 
     def build_model(self):
         options = self.options
@@ -132,9 +135,24 @@ class RNet:
             # question pooling
             WuQ_uQ = mat_weight_mul(uQ, self.WuQ)  # batch_size x q_length x H
             tanh = tf.tanh(WuQ_uQ + self.WvQ)
-            print('Shape of WuQ_uQ: {}'.format(WuQ_uQ.get_shape()))
-
             s = mat_weight_mul(tanh, self.v)
             a = tf.nn.softmax(s, 1)
             rQ = tf.reduce_sum(tf.multiply(a, uQ), 1)
             print('Shape of rQ: {}'.format(rQ.get_shape()))
+
+            # PointerNet
+            weights = {
+                'WhP': self.WhP,
+                'Wha': self.Wha,
+                'v': self.v
+            }
+            pointer_cell = PointerGRUCell(2 * h_size, p_length, weights, gP)
+            fake_inputs = tf.zeros([batch_size, 2, 1])
+            at, _ = tf.nn.dynamic_rnn(pointer_cell,
+                                      fake_inputs,
+                                      initial_state=rQ,
+                                      dtype=tf.float32)
+            print('Shape of at: {}'.format(at.get_shape()))
+
+            pt = tf.argmax(at, axis=2)
+            print('Shape of pt: {}'.format(pt.get_shape()))
