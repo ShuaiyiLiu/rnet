@@ -33,8 +33,8 @@ class RNet:
 
         eP = tf.placeholder(tf.float32, [batch_size, p_length, emb_dim])
         eQ = tf.placeholder(tf.float32, [batch_size, q_length, emb_dim])
-        asi = tf.placeholder(tf.float32, [batch_size, p_length])
-        aei = tf.placeholder(tf.float32, [batch_size, p_length])
+        asi = tf.placeholder(tf.int32, [batch_size, 1])
+        aei = tf.placeholder(tf.int32, [batch_size, 1])
 
         print('Shape of eP: {}'.format(eP.get_shape()))
         print('Shape of eQ: {}'.format(eQ.get_shape()))
@@ -156,3 +156,11 @@ class RNet:
 
             pt = tf.argmax(at, axis=2)
             print('Shape of pt: {}'.format(pt.get_shape()))
+
+        # loss
+        with tf.variable_scope('loss'):
+            sparse_labels = tf.squeeze(tf.stack([asi, aei], 1))
+            print('Shape of sparse_labels: {}'.format(sparse_labels.get_shape()))
+            ce_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=sparse_labels,
+                                                                     logits=at)
+        return ce_loss, pt
