@@ -1,0 +1,9 @@
+.vscode
+.ipynb_checkpoints
+data/*.txt
+data/*.zip
+data/*.json
+*.ipynb
+__pycache__
+*/__pycache__
+models/save
