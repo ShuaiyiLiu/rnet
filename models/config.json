@@ -3,8 +3,8 @@
         "glove": "300",
         "share_context_LSTM":true,
         "char_emb":false,
-        "in_keep_prob":0.8,
-        "batch_size":60,
+        "in_keep_prob":1.0,
+        "batch_size":10,
         "state_size":75,
         "emb_dim" : 300,
         "word_emb_dim" : 300,
@@ -20,6 +20,5 @@
         "queue_size": 1000,
         "num_threads": 2,
         "h_size": 75,
-        "in_keep_prob": 0.8 
 	}
 }

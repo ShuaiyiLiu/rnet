@@ -12,9 +12,17 @@ def mat_weight_mul(mat, weight):
     return tf.reshape(mul, [-1, mat_shape[1], weight_shape[-1]])
 
 
+def masked_softmax(x, axis, mask):
+    m = tf.reduce_max(x, axis=axis, keep_dims=True)
+    e = tf.exp(x - m) * mask
+    s = tf.reduce_sum(e, axis=axis, keep_dims=True)
+    s = tf.clip_by_value(s, 1e-8, 1e8)
+    return e / s
+
+
 class GatedAttentionCell(RNNCell):
 
-    def __init__(self, num_units, weights, encoded_question, reuse=None):
+    def __init__(self, num_units, weights, encoded_question, mask, reuse=None):
         super(GatedAttentionCell, self).__init__(_reuse=reuse)
         self._num_units = num_units
         self.WuQ = weights['WuQ']  # 2H * H
@@ -25,6 +33,7 @@ class GatedAttentionCell(RNNCell):
         self.uQ = encoded_question
         self._cell = tf.contrib.rnn.GRUCell(num_units)
         self.WuQ_uQ = mat_weight_mul(self.uQ, self.WuQ)
+        self.mask = mask
 
     @property
     def state_size(self):
@@ -44,8 +53,8 @@ class GatedAttentionCell(RNNCell):
 
             tanh = tf.tanh(WuQ_uQ + WuP_utP + WvP_vtP)  # batch_size x q_length x h_size
 
-            s_t = mat_weight_mul(tanh, self.v)  # batch_size x q_length
-            a_t = tf.nn.softmax(s_t, 1)  # batch_size x q_length
+            s_t = mat_weight_mul(tanh, self.v)  # batch_size x q_length x 1
+            a_t = masked_softmax(s_t, 1, tf.expand_dims(self.mask, 2))  # batch_size x q_length
             c_t = tf.reduce_sum(tf.multiply(a_t, self.uQ), 1)  # batch_size x 2h_size
 
             utP_ct = tf.concat([utP, c_t], 1)  # batch_size x 4H
@@ -57,7 +66,7 @@ class GatedAttentionCell(RNNCell):
 
 class GatedAttentionSelfMatchingCell(RNNCell):
 
-    def __init__(self, num_units, weights, encoded_question, reuse=None):
+    def __init__(self, num_units, weights, encoded_question, mask, reuse=None):
         super(GatedAttentionSelfMatchingCell, self).__init__(_reuse=reuse)
         self._num_units = num_units
         self.WvP = weights['WvP']  # H * H
@@ -67,6 +76,7 @@ class GatedAttentionSelfMatchingCell(RNNCell):
         self.vP = encoded_question
         self._cell = tf.contrib.rnn.GRUCell(num_units)
         self.WvP_vP = mat_weight_mul(self.vP, self.WvP)
+        self.mask = mask
 
     @property
     def state_size(self):
@@ -85,7 +95,7 @@ class GatedAttentionSelfMatchingCell(RNNCell):
             tanh = tf.tanh(WvP_vP + WvP_hat_vtP)  # batch_size x p_length x h_size
 
             s_t = mat_weight_mul(tanh, self.v)
-            a_t = tf.nn.softmax(s_t, 1)
+            a_t = masked_softmax(s_t, 1, tf.expand_dims(self.mask, 2))
             c_t = tf.reduce_sum(tf.multiply(a_t, self.vP), 1)
             vtP_ct = tf.concat([vtP, c_t], 1)  # batch_size x 2H
             g_t = tf.sigmoid(tf.matmul(vtP_ct, self.Wg2))
@@ -126,3 +136,50 @@ class PointerGRUCell(RNNCell):
             c_t = tf.reduce_sum(tf.multiply(a_t, self.hP), 1)
             new_state, _ = self._cell.call(c_t, state)
             return tf.squeeze(a_t), new_state
+
+if __name__ == '__main__':
+    # test masked softmax
+    import numpy as np
+    def np_masked_softmax(x, axis, mask):
+        m = tf.reduce_max(x, axis=axis, keep_dims=True)
+        e = tf.exp(x - m) * mask
+        s = tf.reduce_sum(e, axis=axis, keep_dims=True)
+        s = tf.clip_by_value(s, 1e-8, 1e8)
+        return e / s
+
+    def length(sequence):
+        used = tf.sign(tf.reduce_max(tf.abs(sequence), 2))
+        length = tf.reduce_sum(used, 1)
+        length = tf.cast(length, tf.int32)
+        return length
+
+    def cross_entropy(labels, predict):
+        predict = tf.clip_by_value(predict, 1e-8, 1.0)
+        return -tf.reduce_sum(labels * tf.log(predict), 1)
+
+    x = tf.constant([[[1.0], [0.0], [2.0], [1.0]], [[1.0], [2.0], [2.0], [1.0]]])
+    mask = tf.constant([[1.0, 1.0, 0.0, 0.0], [1.0, 0, 0, 0]])
+
+    p = tf.constant([[[1.0, 1.0, 2.0, 0], [1.0, 0.0, 2.0, 3.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
+                     [[1.0, 1.0, 2.0, 0], [2.0, 0.0, 1.0, 1.0], [2.0, 0, 0, 0], [0, 0, 0, 0]]])
+    print(x)
+    print(mask)
+    print(p)
+    l = length(p)
+    print(l)
+
+
+    p_mask = tf.sequence_mask(l, 4, dtype=tf.float32)
+
+    sess = tf.Session()
+    print(sess.run(np_masked_softmax(x, 1, tf.expand_dims(mask, 2))))
+    print(sess.run(l))
+    print(sess.run(p_mask))
+
+    print('test error calculation')
+    asi = [[0], [2]]
+    print(sess.run(tf.one_hot(tf.squeeze(asi), 4)))
+
+    sa = tf.one_hot(tf.squeeze(asi), 4)
+    a = [[[0.8], [0.0], [0.0], [0.0]], [[.0], [1.0], [0.0], [0.0]]]
+    print(sess.run(cross_entropy(sa, tf.squeeze(a))))
