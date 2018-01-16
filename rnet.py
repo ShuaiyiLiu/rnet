@@ -79,7 +79,7 @@ def train(args):
                         f1 += f1_score(' '.join(pred_tokens), ' '.join(true_tokens))
                         em += exact_match_score(' '.join(pred_tokens), ' '.join(true_tokens))
                     print('iter:{} - average loss:{}'.format(j, avg_loss_val))
-                    print('f1: {} em: {}'.format(j, f1/len(p_batch), em/len(p_batch)))
+                    print('f1: {} em: {}'.format(f1/len(p_batch), em/len(p_batch)))
             print('saving rnet_model{}.ckpt'.format(i))
             save_path = saver.save(sess, os.path.join(args.save_dir, 'rnet_model{}.ckpt'.format(i)))
         

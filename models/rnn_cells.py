@@ -21,8 +21,10 @@ def _maybe_mask_score(score, memory_sequence_length, score_mask_value=float("-in
     return tf.where(score_mask, score, score_mask_values)
 
 
-def attention_pooling(processed_memory, memory, processed_query, v):
+def attention_pooling(processed_memory, memory, memory_sequence_length, processed_query, v):
     s_t = tf.reduce_sum(v * tf.tanh(processed_memory + processed_query), [2])
+
+    s_t = _maybe_mask_score(s_t, memory_sequence_length)
 
     # alignments, reshaped for broadcasting, batch_size x memory_depth x 1
     a_t = tf.expand_dims(tf.nn.softmax(s_t), 2)
@@ -35,11 +37,13 @@ def attention_pooling(processed_memory, memory, processed_query, v):
 
 class GatedAttentionGRUCell(RNNCell):
 
-    def __init__(self, num_units, memory, memory_units, input_units, incorporate_state=False, reuse=None):
+    def __init__(self, num_units, memory, memory_units, memory_sequence_length,
+                 input_units, incorporate_state=False, reuse=None):
         super(GatedAttentionGRUCell, self).__init__(_reuse=reuse)
         self._num_units = num_units
         self._cell = tf.contrib.rnn.GRUCell(num_units)
         self.memory = memory
+        self.memory_sequence_length = memory_sequence_length
 
         # weights initialization
         with tf.variable_scope('weights', reuse=tf.AUTO_REUSE):
@@ -58,7 +62,8 @@ class GatedAttentionGRUCell(RNNCell):
                 'W_g', shape=[memory_units + input_units, memory_units + input_units],
                 dtype=tf.float32, initializer=xavier_initializer())
 
-            self.v = tf.get_variable('v_attnetion', shape=[num_units], dtype=tf.float32, initializer=xavier_initializer())
+            self.v = tf.get_variable(
+                'v_attnetion', shape=[num_units], dtype=tf.float32, initializer=xavier_initializer())
 
         # processed memory
         self.keys = mat_weight_mul(memory, self.W_mem)
@@ -82,7 +87,7 @@ class GatedAttentionGRUCell(RNNCell):
 
             processed_query = tf.expand_dims(processed_query, 1)
 
-            c_t = attention_pooling(self.keys, self.memory, processed_query, self.v)[-1]
+            c_t = attention_pooling(self.keys, self.memory, self.memory_sequence_length, processed_query, self.v)[-1]
 
             ct_extended = tf.concat([inputs, c_t], 1) # batch_size x (memory_units + input_units)
 

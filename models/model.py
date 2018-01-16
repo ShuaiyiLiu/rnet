@@ -2,16 +2,10 @@
 import math
 import tensorflow as tf
 from tensorflow.contrib.layers import xavier_initializer
-from .rnn_cells import mat_weight_mul, GatedAttentionGRUCell, attention_pooling
+from .rnn_cells import mat_weight_mul, GatedAttentionGRUCell, attention_pooling, _maybe_mask_score
 
 
 class RNet:
-    @staticmethod
-    def dropout_wrapped_grucell(hidden_size, in_keep_prob):
-        cell = tf.contrib.rnn.GRUCell(hidden_size)
-        cell = tf.contrib.rnn.DropoutWrapper(cell, input_keep_prob=in_keep_prob)
-        return cell
-
     @staticmethod
     def length(sequence):
         used = tf.sign(tf.reduce_max(tf.abs(sequence), 2))
@@ -50,14 +44,12 @@ class RNet:
         ePcP = eP
         qlen = self.length(eQ)
         plen = self.length(eP)
-        p_mask = tf.sequence_mask(plen, p_max_length, dtype=tf.float32)
-        q_mask = tf.sequence_mask(qlen, q_max_length, dtype=tf.float32)
 
         # Question and Passage Encoder
         with tf.variable_scope('encoder') as scope:
-            gru_cells_fw = tf.nn.rnn_cell.MultiRNNCell([self.dropout_wrapped_grucell(h_size, in_keep_prob)
+            gru_cells_fw = tf.nn.rnn_cell.MultiRNNCell([tf.contrib.rnn.GRUCell(h_size)
                                                         for _ in range(num_of_layers)])
-            gru_cells_bw = tf.nn.rnn_cell.MultiRNNCell([self.dropout_wrapped_grucell(h_size, in_keep_prob)
+            gru_cells_bw = tf.nn.rnn_cell.MultiRNNCell([tf.contrib.rnn.GRUCell(h_size)
                                                         for _ in range(num_of_layers)])
 
             uQ_2, _ = tf.nn.bidirectional_dynamic_rnn(
@@ -73,8 +65,8 @@ class RNet:
 
         # Question and passage matching
         with tf.variable_scope('attention_matching'):
-            attn_cells_fw = GatedAttentionGRUCell(h_size, uQ, 2 * h_size, 2 * h_size, True)
-            attn_cells_bw = GatedAttentionGRUCell(h_size, uQ, 2 * h_size, 2 * h_size, True)
+            attn_cells_fw = GatedAttentionGRUCell(h_size, uQ, 2 * h_size, qlen, 2 * h_size, True)
+            attn_cells_bw = GatedAttentionGRUCell(h_size, uQ, 2 * h_size, qlen, 2 * h_size, True)
             vP_2, _ = tf.nn.bidirectional_dynamic_rnn(attn_cells_fw, attn_cells_bw, dtype=tf.float32, inputs=uP)
             vP = tf.concat(vP_2, 2)
             vP = tf.nn.dropout(vP, in_keep_prob)
@@ -82,8 +74,8 @@ class RNet:
 
         # self matching layer
         with tf.variable_scope('self_matching'):
-            attn_sm_cells_fw = GatedAttentionGRUCell(h_size, vP, 2 * h_size, 2 * h_size, False)
-            attn_sm_cells_bw = GatedAttentionGRUCell(h_size, vP, 2 * h_size, 2 * h_size, False)
+            attn_sm_cells_fw = GatedAttentionGRUCell(h_size, vP, 2 * h_size, plen, 2 * h_size, False)
+            attn_sm_cells_bw = GatedAttentionGRUCell(h_size, vP, 2 * h_size, plen, 2 * h_size, False)
             hP_2, _ = tf.nn.bidirectional_dynamic_rnn(attn_sm_cells_fw,
                                                       attn_sm_cells_bw,
                                                       inputs=vP,
@@ -102,6 +94,7 @@ class RNet:
             gP_2, _ = tf.nn.bidirectional_dynamic_rnn(
                 gru_cells_fw2, gru_cells_bw2, hP, dtype=tf.float32, scope='deeply_integration')
             hP = tf.concat(gP_2, 2)
+            hP = tf.nn.dropout(hP, in_keep_prob)
 
         # question pooling
         with tf.variable_scope('question_pooling'):
@@ -111,7 +104,7 @@ class RNet:
             WvQVrQ = tf.get_variable(
                 'WvQVrQ', shape=[1, h_size], dtype=tf.float32, initializer=xavier_initializer())
             v0 = tf.get_variable('v0', shape=[h_size], dtype=tf.float32, initializer=xavier_initializer())
-            rQ = attention_pooling(WuQ_uQ, uQ, WvQVrQ, v0)[-1]
+            rQ = attention_pooling(WuQ_uQ, uQ, qlen, WvQVrQ, v0)[-1]
             print('Shape of rQ: {}'.format(rQ.get_shape()))
 
         # PointerNet
@@ -126,11 +119,11 @@ class RNet:
 
             processed_memory = mat_weight_mul(hP, WhP)
             processed_query = tf.expand_dims(tf.matmul(state, Wha), 1)
-            s_0, _, c_0 = attention_pooling(processed_memory, hP, processed_query, v1)
+            s_0, _, c_0 = attention_pooling(processed_memory, hP, plen, processed_query, v1)
 
             state, _ = gru_cell.call(c_0, state)
             processed_query = tf.expand_dims(tf.matmul(state, Wha), 1)
-            s_1, _, c_1 = attention_pooling(processed_memory, hP, processed_query, v1)
+            s_1, _, c_1 = attention_pooling(processed_memory, hP, plen, processed_query, v1)
 
         with tf.variable_scope('loss'):
             loss_0 = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=tf.squeeze(asi),
