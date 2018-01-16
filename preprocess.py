@@ -177,7 +177,7 @@ class DataProcessor:
                 coord.request_stop()
         
 
-    def provide(self, sess):
+    def provide(self):
         '''
         creates enqueue and dequeue operations to build input pipeline
         '''

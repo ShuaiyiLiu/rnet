@@ -40,12 +40,13 @@ def train(args):
     print('Reading data')
     dp = preprocess.read_data('train', opt)
     sess = tf.Session(config=config)
-    it, enqueue_op = dp.provide(sess)
+    it, enqueue_op = dp.provide()
 
     rnet_model = model.RNet(opt)
-    loss, pt, accu = rnet_model.build_model(it)
+    loss, pt = rnet_model.build_model(it)
     avg_loss = tf.reduce_mean(loss)
     train_op = tf.train.AdadeltaOptimizer(1.0, rho=0.95, epsilon=1e-06).minimize(loss)
+    dequeued_p, asi, aei = it['p'], it['asi'], it['aei']
 
     # saving model
     saver = tf.train.Saver()
@@ -66,9 +67,19 @@ def train(args):
             print('Training...{}th epoch'.format(i))
             training_time = int(dp.num_sample/dp.batch_size)
             for j in tqdm(range(training_time)):
-                _, avg_loss_val, pt_val = sess.run([train_op, avg_loss, pt])
+                _, avg_loss_val, pt_val, p_batch, asi_batch, aei_batch = sess.run([train_op, avg_loss, pt, dequeued_p, asi, aei])
                 if j % 100 == 0:
+                    f1, em = 0.0, 0.0
+                    for k in range(len(p_batch)):
+                        paragraph = p_batch[k][0].decode('utf8').split(' ')
+                        true_start, true_end = asi_batch[k][0], aei_batch[k][0]
+                        pred_start, pred_end = pt_val[k][0], pt_val[k][1]
+                        pred_tokens = paragraph[pred_start:(pred_end+1)]
+                        true_tokens = paragraph[true_start:(true_end+1)]
+                        f1 += f1_score(' '.join(pred_tokens), ' '.join(true_tokens))
+                        em += exact_match_score(' '.join(pred_tokens), ' '.join(true_tokens))
                     print('iter:{} - average loss:{}'.format(j, avg_loss_val))
+                    print('f1: {} em: {}'.format(j, f1/len(p_batch), em/len(p_batch)))
             print('saving rnet_model{}.ckpt'.format(i))
             save_path = saver.save(sess, os.path.join(args.save_dir, 'rnet_model{}.ckpt'.format(i)))
         
@@ -97,7 +108,7 @@ def evaluate(args):
         dp = preprocess.read_data('dev', opt)
         it, enqueue_op = dp.provide(sess)
         rnet_model = model.RNet(opt)
-        loss, pt, accu = rnet_model.build_model(it)
+        loss, pt = rnet_model.build_model(it)
         dequeued_p, asi, aei = it['p'], it['asi'], it['aei']
         
          # restore model

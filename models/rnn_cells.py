@@ -1,5 +1,5 @@
-from tensorflow.python.ops import variable_scope as vs
 from tensorflow.contrib.rnn import RNNCell
+from tensorflow.contrib.layers import xavier_initializer
 import tensorflow as tf
 
 
@@ -12,28 +12,57 @@ def mat_weight_mul(mat, weight):
     return tf.reshape(mul, [-1, mat_shape[1], weight_shape[-1]])
 
 
-def masked_softmax(x, axis, mask):
-    m = tf.reduce_max(x, axis=axis, keep_dims=True)
-    e = tf.exp(x - m) * mask
-    s = tf.reduce_sum(e, axis=axis, keep_dims=True)
-    s = tf.clip_by_value(s, 1e-8, 1e8)
-    return e / s
+def _maybe_mask_score(score, memory_sequence_length, score_mask_value=float("-inf")):
+    if memory_sequence_length is None:
+        return score
+    score_mask = tf.sequence_mask(
+        memory_sequence_length, maxlen=tf.shape(score)[1])
+    score_mask_values = score_mask_value * tf.ones_like(score)
+    return tf.where(score_mask, score, score_mask_values)
 
 
-class GatedAttentionCell(RNNCell):
+def attention_pooling(processed_memory, memory, processed_query, v):
+    s_t = tf.reduce_sum(v * tf.tanh(processed_memory + processed_query), [2])
 
-    def __init__(self, num_units, weights, encoded_question, mask, reuse=None):
-        super(GatedAttentionCell, self).__init__(_reuse=reuse)
+    # alignments, reshaped for broadcasting, batch_size x memory_depth x 1
+    a_t = tf.expand_dims(tf.nn.softmax(s_t), 2)
+
+    # attention-pooling vector, batch_size x memory_units
+    c_t = tf.reduce_sum(a_t * memory, 1)
+
+    return s_t, a_t, c_t
+
+
+class GatedAttentionGRUCell(RNNCell):
+
+    def __init__(self, num_units, memory, memory_units, input_units, incorporate_state=False, reuse=None):
+        super(GatedAttentionGRUCell, self).__init__(_reuse=reuse)
         self._num_units = num_units
-        self.WuQ = weights['WuQ']  # 2H * H
-        self.WuP = weights['WuP']  # 2H * H
-        self.WvP = weights['WvP']  # H * H
-        self.v = weights['v']  # H x 1
-        self.Wg = weights['Wg']  # 4H x 4H
-        self.uQ = encoded_question
         self._cell = tf.contrib.rnn.GRUCell(num_units)
-        self.WuQ_uQ = mat_weight_mul(self.uQ, self.WuQ)
-        self.mask = mask
+        self.memory = memory
+
+        # weights initialization
+        with tf.variable_scope('weights', reuse=tf.AUTO_REUSE):
+            self.W_mem = tf.get_variable(
+                'W_mem', shape=[memory_units, num_units], dtype=tf.float32, initializer=xavier_initializer())
+
+            self.W_input = tf.get_variable(
+                'W_input', shape=[input_units, num_units], dtype=tf.float32, initializer=xavier_initializer())
+
+            self.W_state = None
+            if incorporate_state:
+                self.W_state = tf.get_variable(
+                    'W_state', shape=[num_units, num_units], dtype=tf.float32, initializer=xavier_initializer())
+
+            self.W_g = tf.get_variable(
+                'W_g', shape=[memory_units + input_units, memory_units + input_units],
+                dtype=tf.float32, initializer=xavier_initializer())
+
+            self.v = tf.get_variable('v_attnetion', shape=[num_units], dtype=tf.float32, initializer=xavier_initializer())
+
+        # processed memory
+        self.keys = mat_weight_mul(memory, self.W_mem)
+
 
     @property
     def state_size(self):
@@ -44,98 +73,25 @@ class GatedAttentionCell(RNNCell):
         return self._num_units
 
     def call(self, inputs, state):
-        with vs.variable_scope('attention_pool'):
-            utP = inputs  # batch_size * 2H
-            vtP = state
-            WuQ_uQ = self.WuQ_uQ
-            WuP_utP = tf.expand_dims(tf.matmul(utP, self.WuP), 1)  # batch_size x 1 x H
-            WvP_vtP = tf.expand_dims(tf.matmul(vtP, self.WvP), 1)  # batch_size x 1 x H
+        with tf.variable_scope('attention_pool'):
+            # compute processed query
+            processed_query = tf.matmul(inputs, self.W_input)
+            if self.W_state is not None:
+                # incorporate processed state into query
+                processed_query += tf.matmul(state, self.W_state)
 
-            tanh = tf.tanh(WuQ_uQ + WuP_utP + WvP_vtP)  # batch_size x q_length x h_size
+            processed_query = tf.expand_dims(processed_query, 1)
 
-            s_t = mat_weight_mul(tanh, self.v)  # batch_size x q_length x 1
-            a_t = masked_softmax(s_t, 1, tf.expand_dims(self.mask, 2))  # batch_size x q_length
-            c_t = tf.reduce_sum(tf.multiply(a_t, self.uQ), 1)  # batch_size x 2h_size
+            c_t = attention_pooling(self.keys, self.memory, processed_query, self.v)[-1]
 
-            utP_ct = tf.concat([utP, c_t], 1)  # batch_size x 4H
-            g_t = tf.sigmoid(tf.matmul(utP_ct, self.Wg))  # batch_size x 4H
-            new_inputs = tf.multiply(g_t, utP_ct)
+            ct_extended = tf.concat([inputs, c_t], 1) # batch_size x (memory_units + input_units)
 
-            return self._cell.call(new_inputs, state)
+            g_t = tf.sigmoid(tf.matmul(ct_extended, self.W_g)) # batch_size x (memory_units + input_units)
 
+            ct_extended_star = g_t * ct_extended
 
-class GatedAttentionSelfMatchingCell(RNNCell):
+            return self._cell.call(ct_extended_star, state)
 
-    def __init__(self, num_units, weights, encoded_question, mask, reuse=None):
-        super(GatedAttentionSelfMatchingCell, self).__init__(_reuse=reuse)
-        self._num_units = num_units
-        self.WvP = weights['WvP']  # H * H
-        self.WvP_hat = weights['WvP_hat']  # H * H
-        self.v = weights['v']  # H x 1
-        self.Wg2 = weights['Wg2']
-        self.vP = encoded_question
-        self._cell = tf.contrib.rnn.GRUCell(num_units)
-        self.WvP_vP = mat_weight_mul(self.vP, self.WvP)
-        self.mask = mask
-
-    @property
-    def state_size(self):
-        return self._num_units
-
-    @property
-    def output_size(self):
-        return self._num_units
-
-    def call(self, inputs, state):
-        with vs.variable_scope('self_matching_pool'):
-            vtP = inputs  # batch_size * H
-            htP = state
-            WvP_vP = self.WvP_vP
-            WvP_hat_vtP = tf.expand_dims(tf.matmul(vtP, self.WvP_hat), 1)  # batch_size x 1 x H
-            tanh = tf.tanh(WvP_vP + WvP_hat_vtP)  # batch_size x p_length x h_size
-
-            s_t = mat_weight_mul(tanh, self.v)
-            a_t = masked_softmax(s_t, 1, tf.expand_dims(self.mask, 2))
-            c_t = tf.reduce_sum(tf.multiply(a_t, self.vP), 1)
-            vtP_ct = tf.concat([vtP, c_t], 1)  # batch_size x 2H
-            g_t = tf.sigmoid(tf.matmul(vtP_ct, self.Wg2))
-            new_inputs = tf.multiply(g_t, vtP_ct)
-
-            return self._cell.call(new_inputs, state)
-
-
-class PointerGRUCell(RNNCell):
-
-    def __init__(self, num_units, output_size, weights, encoded_passage, reuse=None):
-        super(PointerGRUCell, self).__init__(_reuse=reuse)
-        self._num_units = num_units
-        self._output_size = output_size
-        self._cell = tf.contrib.rnn.GRUCell(num_units)
-        self.WhP = weights['WhP']
-        self.Wha = weights['Wha']
-        self.v = weights['v']
-        self.hP = encoded_passage
-        self.WhP_hP = mat_weight_mul(self.hP, self.WhP)
-
-    @property
-    def state_size(self):
-        return self._num_units
-
-    @property
-    def output_size(self):
-        return self._output_size
-
-    def call(self, inputs, state):
-        with vs.variable_scope('pointer_pool'):
-            h_tm1a = state
-            Wha_htm1a = tf.expand_dims(tf.matmul(h_tm1a, self.Wha), 1)  # batch_size x 1 x H
-
-            tanh = tf.tanh(self.WhP_hP + Wha_htm1a)
-            s_t = mat_weight_mul(tanh, self.v)
-            a_t = tf.nn.softmax(s_t, 1)
-            c_t = tf.reduce_sum(tf.multiply(a_t, self.hP), 1)
-            new_state, _ = self._cell.call(c_t, state)
-            return tf.squeeze(a_t), new_state
 
 if __name__ == '__main__':
     # test masked softmax
@@ -153,12 +109,11 @@ if __name__ == '__main__':
         length = tf.cast(length, tf.int32)
         return length
 
-    def cross_entropy(labels, predict):
-        predict = tf.clip_by_value(predict, 1e-8, 1.0)
-        return -tf.reduce_sum(labels * tf.log(predict), 1)
+    def cross_entropy(labels, predict, mask):
+        return -tf.reduce_sum(labels * tf.log(predict - mask + 1.0), 1)
 
-    x = tf.constant([[[1.0], [0.0], [2.0], [1.0]], [[1.0], [2.0], [2.0], [1.0]]])
-    mask = tf.constant([[1.0, 1.0, 0.0, 0.0], [1.0, 0, 0, 0]])
+    x = tf.constant([[[1.0], [0.0], [0.0], [0.0]], [[1.0], [2.0], [2.0], [0.0]]])
+    mask = tf.constant([[1.0, 1.0, 0.0, 0.0], [1.0, 1.0, 1.0, 0]])
 
     p = tf.constant([[[1.0, 1.0, 2.0, 0], [1.0, 0.0, 2.0, 3.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]],
                      [[1.0, 1.0, 2.0, 0], [2.0, 0.0, 1.0, 1.0], [2.0, 0, 0, 0], [0, 0, 0, 0]]])
@@ -172,6 +127,7 @@ if __name__ == '__main__':
     p_mask = tf.sequence_mask(l, 4, dtype=tf.float32)
 
     sess = tf.Session()
+    softmaxed = np_masked_softmax(x, 1, tf.expand_dims(mask, 2))
     print(sess.run(np_masked_softmax(x, 1, tf.expand_dims(mask, 2))))
     print(sess.run(l))
     print(sess.run(p_mask))
@@ -181,5 +137,13 @@ if __name__ == '__main__':
     print(sess.run(tf.one_hot(tf.squeeze(asi), 4)))
 
     sa = tf.one_hot(tf.squeeze(asi), 4)
-    a = [[[0.8], [0.0], [0.0], [0.0]], [[.0], [1.0], [0.0], [0.0]]]
-    print(sess.run(cross_entropy(sa, tf.squeeze(a))))
+    a = [[[1.0], [0.0], [0.0], [0.0]], [[.0], [1.0], [0.0], [0.0]]]
+    print(sess.run(sa))
+
+    print(sess.run(tf.squeeze(softmaxed) - mask + 1.0))
+    print(sess.run(cross_entropy(sa, tf.squeeze(softmaxed), mask)))
+
+
+    as_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=tf.squeeze(asi),
+                                                             logits=tf.squeeze(x))
+    print(sess.run(as_loss))
